@@ -341,6 +341,27 @@ async def register_user(user: UserCreate):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# @app.post("/api/auth/token", response_model=Token)
+# async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+#     user = authenticate_user(form_data.username, form_data.password)
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Incorrect email or password",
+#             headers={"WWW-Authenticate": "Bearer"},
+#         )
+#
+#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+#     access_token = create_access_token(
+#         data={"sub": user.email, "is_2fa_verified": False},  # Explicitly set to False
+#         expires_delta=access_token_expires
+#     )
+#     return {
+#         "access_token": access_token,
+#         "token_type": "bearer",
+#         "requires_2fa": user.is_2fa_enabled
+#     }
+
 @app.post("/api/auth/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
@@ -351,15 +372,33 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Get full user details from database
+    user_data = db.users.find_one({"email": user.email})
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Prepare user details to return
+    user_details = {
+        "id": str(user_data["_id"]),
+        "email": user_data["email"],
+        "first_name": user_data["first_name"],
+        "last_name": user_data["last_name"],
+        "is_2fa_enabled": user_data.get("is_2fa_enabled", False),
+        "created_at": user_data["created_at"],
+        "totp_secret": user_data.get("totp_secret") if user_data.get("is_2fa_enabled") else None
+    }
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email, "is_2fa_verified": False},  # Explicitly set to False
+        data={"sub": user.email, "is_2fa_verified": False},
         expires_delta=access_token_expires
     )
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "requires_2fa": user.is_2fa_enabled
+        "requires_2fa": user_data.get("is_2fa_enabled", False),
+        "user_details": user_details
     }
 
 @app.get("/api/auth/setup-2fa", response_model=TwoFactorSetup)
