@@ -464,6 +464,41 @@ async def verify_2fa_setup(verify_data: TwoFactorVerify, current_user: User = De
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# @app.post("/api/auth/verify-2fa")
+# async def verify_2fa(
+#     verify_data: TwoFactorVerify,
+#     token: str = Depends(oauth2_scheme)
+# ):
+#     try:
+#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+#         email = payload.get("sub")
+#         if email is None:
+#             raise HTTPException(status_code=401, detail="Invalid token")
+#     except JWTError:
+#         raise HTTPException(status_code=401, detail="Invalid token")
+#
+#     user_data = db.users.find_one({"email": email})
+#     if not user_data:
+#         raise HTTPException(status_code=404, detail="User not found")
+#
+#         # Use the secret from the request if provided (for setup), otherwise from DB
+#     secret = verify_data.secret if verify_data.secret else user_data.get("totp_secret")
+#     if not secret:
+#         raise HTTPException(status_code=400, detail="2FA not configured")
+#
+#     totp = pyotp.TOTP(secret)
+#     if not totp.verify(verify_data.code):
+#         raise HTTPException(status_code=400, detail="Invalid verification code")
+#
+#     # Create new token with verified status
+#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+#     access_token = create_access_token(
+#         data={"sub": email, "is_2fa_verified": True},
+#         expires_delta=access_token_expires
+#     )
+#
+#     return {"access_token": access_token, "token_type": "bearer"}
+
 @app.post("/api/auth/verify-2fa")
 async def verify_2fa(
     verify_data: TwoFactorVerify,
@@ -481,7 +516,7 @@ async def verify_2fa(
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
 
-        # Use the secret from the request if provided (for setup), otherwise from DB
+    # Use secret from request if provided, otherwise from DB
     secret = verify_data.secret if verify_data.secret else user_data.get("totp_secret")
     if not secret:
         raise HTTPException(status_code=400, detail="2FA not configured")
@@ -493,7 +528,7 @@ async def verify_2fa(
     # Create new token with verified status
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": email, "is_2fa_verified": True},
+        data={"sub": email, "is_2fa_verified": True},  # ← This must be True
         expires_delta=access_token_expires
     )
 
