@@ -1,3 +1,5 @@
+from logging import exception
+
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -185,6 +187,7 @@ def authenticate_user(email, password):
     return User(**user_data)
 
 
+# Enhanced helper functions
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -192,6 +195,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
+    # Ensure is_2fa_verified is always included
+    if "is_2fa_verified" not in to_encode:
+        to_encode["is_2fa_verified"] = False
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -207,19 +213,22 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         email: str = payload.get("sub")
         if email is None:
             raise credentials_exception
-        token_data = TokenData(email=email, is_2fa_verified=payload.get("is_2fa_verified", False))
+
+        # Get user from database to check 2FA status
+        user = get_user(email)
+        if user is None:
+            raise credentials_exception
+            # If 2FA is enabled but token isn't verified
+        if user.is_2fa_enabled and not payload.get("is_2fa_verified", False):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Two-factor authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        return user
     except JWTError:
         raise credentials_exception
-    user = get_user(email=token_data.email)
-    if user is None:
-        raise credentials_exception
-    if user.is_2fa_enabled and not token_data.is_2fa_verified:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Two-factor authentication required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
 
 
 # Enhanced fraud detection algorithm
@@ -344,15 +353,14 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+        data={"sub": user.email, "is_2fa_verified": False},  # Explicitly set to False
+        expires_delta=access_token_expires
     )
-
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "requires_2fa": user.is_2fa_enabled
     }
-
 
 @app.get("/api/auth/setup-2fa", response_model=TwoFactorSetup)
 async def setup_2fa(current_user: User = Depends(get_current_user)):
@@ -418,7 +426,10 @@ async def verify_2fa_setup(verify_data: TwoFactorVerify, current_user: User = De
 
 
 @app.post("/api/auth/verify-2fa")
-async def verify_2fa(verify_data: TwoFactorVerify, token: str = Depends(oauth2_scheme)):
+async def verify_2fa(
+    verify_data: TwoFactorVerify,
+    token: str = Depends(oauth2_scheme)
+):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
@@ -431,14 +442,16 @@ async def verify_2fa(verify_data: TwoFactorVerify, token: str = Depends(oauth2_s
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Create a TOTP object with the user's secret
-    totp = pyotp.TOTP(user_data["totp_secret"])
+        # Use the secret from the request if provided (for setup), otherwise from DB
+    secret = verify_data.secret if verify_data.secret else user_data.get("totp_secret")
+    if not secret:
+        raise HTTPException(status_code=400, detail="2FA not configured")
 
-    # Verify the code
+    totp = pyotp.TOTP(secret)
     if not totp.verify(verify_data.code):
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
-    # Create a new token with 2FA verified
+    # Create new token with verified status
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": email, "is_2fa_verified": True},
