@@ -652,7 +652,7 @@ async def export_transactions(
         writer.writerow([
             transaction["id"],
             transaction["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-            f"${transaction['amount']:.2f}",
+            f"₦{transaction['amount']:.2f}",
             transaction["merchant"],
             transaction["location"],
             "Fraudulent" if transaction["is_fraudulent"] else "Legitimate",
