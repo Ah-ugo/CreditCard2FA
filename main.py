@@ -24,7 +24,7 @@ from faker import Faker
 from sklearn.ensemble import IsolationForest
 import joblib
 from pathlib import Path
-
+from sklearn.exceptions import NotFittedError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,8 +57,11 @@ def initialize_fraud_model():
     if Path(FRAUD_MODEL_PATH).exists():
         return joblib.load(FRAUD_MODEL_PATH)
     else:
-        # Create a simple Isolation Forest model as a placeholder
+        # Create and train a simple Isolation Forest model with dummy data
         model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+        # Train with some dummy data
+        X_dummy = np.random.rand(100, 5)  # 100 samples, 5 features
+        model.fit(X_dummy)
         joblib.dump(model, FRAUD_MODEL_PATH)
         return model
 
