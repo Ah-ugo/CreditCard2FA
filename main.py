@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -21,11 +21,18 @@ import csv
 import uuid
 import numpy as np
 from faker import Faker
-from sklearn.ensemble import IsolationForest
 import joblib
 from pathlib import Path
-from sklearn.exceptions import NotFittedError
+import pandas as pd
+import logging
 from dotenv import load_dotenv
+
+# Import our new fraud detection model
+from fraud_detection_model import FraudDetectionModel, create_sample_dataset
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -48,25 +55,14 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
-# Fraud detection model setup
-FRAUD_MODEL_PATH = "fraud_detection_model.joblib"
+# Initialize our improved fraud detection model
+fraud_model = FraudDetectionModel("fraud_detection_model.joblib")
 
-
-def initialize_fraud_model():
-    """Initialize or load the fraud detection model"""
-    if Path(FRAUD_MODEL_PATH).exists():
-        return joblib.load(FRAUD_MODEL_PATH)
-    else:
-        # Create and train a simple Isolation Forest model with dummy data
-        model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
-        # Train with some dummy data
-        X_dummy = np.random.rand(100, 5)  # 100 samples, 5 features
-        model.fit(X_dummy)
-        joblib.dump(model, FRAUD_MODEL_PATH)
-        return model
-
-
-fraud_model = initialize_fraud_model()
+# Ensure the model is initially trained with some sample data if it's not already
+if not fraud_model.is_trained:
+    logger.info("Training fraud model with sample data...")
+    X, _ = create_sample_dataset(2000)  # Create 2000 sample transactions
+    fraud_model.fit(X)
 
 app = FastAPI(title="Credit Card Fraud Detection API")
 
@@ -104,6 +100,7 @@ class Token(BaseModel):
     access_token: str
     token_type: str
     requires_2fa: bool = False
+    user_details: Optional[Dict[str, Any]] = None
 
 
 class TokenData(BaseModel):
@@ -234,7 +231,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
 
 
-# Enhanced fraud detection algorithm
 def detect_fraud(transaction: TransactionCreate, user_id: str) -> tuple:
     """Enhanced fraud detection with machine learning and rule-based checks"""
     # Get user's transaction history
@@ -269,16 +265,27 @@ def detect_fraud(transaction: TransactionCreate, user_id: str) -> tuple:
                            if (datetime.utcnow() - t['timestamp']).total_seconds() < recent_hours * 3600)
         features['frequency'] = recent_count / recent_hours
 
-    # Convert features to array for ML model
-    feature_values = np.array([[features['amount'],
-                                features['amount_diff'],
-                                features['frequency'],
-                                features['location_change'],
-                                features['merchant_risk']]])
+    # Use our improved fraud detection model
+    try:
+        # Convert features to DataFrame for the model
+        feature_df = pd.DataFrame([{
+            'amount': features['amount'],
+            'hour_of_day': features['hour_of_day'],
+            'frequency': features['frequency'],
+            'location_change': features['location_change'],
+            'merchant_risk': features['merchant_risk']
+        }])
 
-    # Get ML prediction (-1 for outlier/anomaly, 1 for normal)
-    ml_score = fraud_model.decision_function(feature_values)[0]
-    ml_prediction = fraud_model.predict(feature_values)[0]
+        # Get prediction from our model
+        prediction, ml_score = fraud_model.predict(feature_df)
+
+        # Convert score to 0-100 scale (higher = more suspicious)
+        ml_contribution = (1 - ml_score) * 100
+    except Exception as e:
+        logger.error(f"Error in ML prediction: {str(e)}")
+        # Default values if prediction fails
+        prediction = 1  # Normal
+        ml_contribution = 50  # Neutral score
 
     # Rule-based checks
     risk_score = 0
@@ -307,15 +314,14 @@ def detect_fraud(transaction: TransactionCreate, user_id: str) -> tuple:
     if features['merchant_risk'] > 0.8:
         risk_score += 30
 
-    # Combine ML score with rule-based score (ML score ranges typically -0.5 to 0.5)
-    ml_contribution = (0.5 - ml_score) * 100  # Convert to 0-100 scale
+    # Combine ML score with rule-based score
     combined_score = (risk_score * 0.4) + (ml_contribution * 0.6)
 
     # Cap at 100
     final_score = min(100, combined_score)
 
     # Determine if fraudulent (threshold at 75)
-    is_fraudulent = final_score >= 75
+    is_fraudulent = final_score >= 75 or prediction == -1
 
     return is_fraudulent, int(final_score)
 
@@ -343,27 +349,6 @@ async def register_user(user: UserCreate):
 
     return {"access_token": access_token, "token_type": "bearer"}
 
-
-# @app.post("/api/auth/token", response_model=Token)
-# async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-#     user = authenticate_user(form_data.username, form_data.password)
-#     if not user:
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Incorrect email or password",
-#             headers={"WWW-Authenticate": "Bearer"},
-#         )
-#
-#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-#     access_token = create_access_token(
-#         data={"sub": user.email, "is_2fa_verified": False},  # Explicitly set to False
-#         expires_delta=access_token_expires
-#     )
-#     return {
-#         "access_token": access_token,
-#         "token_type": "bearer",
-#         "requires_2fa": user.is_2fa_enabled
-#     }
 
 @app.post("/api/auth/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -403,6 +388,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         "requires_2fa": user_data.get("is_2fa_enabled", False),
         "user_details": user_details
     }
+
 
 @app.get("/api/auth/setup-2fa", response_model=TwoFactorSetup)
 async def setup_2fa(current_user: User = Depends(get_current_user)):
@@ -467,45 +453,10 @@ async def verify_2fa_setup(verify_data: TwoFactorVerify, current_user: User = De
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-# @app.post("/api/auth/verify-2fa")
-# async def verify_2fa(
-#     verify_data: TwoFactorVerify,
-#     token: str = Depends(oauth2_scheme)
-# ):
-#     try:
-#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-#         email = payload.get("sub")
-#         if email is None:
-#             raise HTTPException(status_code=401, detail="Invalid token")
-#     except JWTError:
-#         raise HTTPException(status_code=401, detail="Invalid token")
-#
-#     user_data = db.users.find_one({"email": email})
-#     if not user_data:
-#         raise HTTPException(status_code=404, detail="User not found")
-#
-#         # Use the secret from the request if provided (for setup), otherwise from DB
-#     secret = verify_data.secret if verify_data.secret else user_data.get("totp_secret")
-#     if not secret:
-#         raise HTTPException(status_code=400, detail="2FA not configured")
-#
-#     totp = pyotp.TOTP(secret)
-#     if not totp.verify(verify_data.code):
-#         raise HTTPException(status_code=400, detail="Invalid verification code")
-#
-#     # Create new token with verified status
-#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-#     access_token = create_access_token(
-#         data={"sub": email, "is_2fa_verified": True},
-#         expires_delta=access_token_expires
-#     )
-#
-#     return {"access_token": access_token, "token_type": "bearer"}
-
 @app.post("/api/auth/verify-2fa")
 async def verify_2fa(
-    verify_data: TwoFactorVerify,
-    token: str = Depends(oauth2_scheme)
+        verify_data: TwoFactorVerify,
+        token: str = Depends(oauth2_scheme)
 ):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -810,6 +761,10 @@ async def seed_data(current_user: User = Depends(get_current_user)):
 
     # Generate transactions with realistic patterns
     transactions = []
+
+    # Create feature array for model training
+    training_features = []
+
     for i in range(100):  # Generate 100 transactions
         # Choose a merchant category weighted by risk
         category = random.choices(
@@ -876,14 +831,73 @@ async def seed_data(current_user: User = Depends(get_current_user)):
             "category": category  # Adding category for potential analytics
         })
 
+        # Add features for model training
+        training_features.append([
+            amount,
+            hour,
+            1 if location != base_city else 0,  # location change
+            base_risk,
+            risk_score / 100  # normalize risk score
+        ])
+
     # Insert transactions
     if transactions:
         db.transactions.insert_many(transactions)
 
-    # Update the fraud model with the new data
-    X = np.array([[t['amount'], t['risk_score'] / 100, 1 if t['is_fraudulent'] else 0]
-                  for t in transactions])
-    fraud_model.fit(X)
-    joblib.dump(fraud_model, FRAUD_MODEL_PATH)
+    # Update the fraud model with the new data if we have enough transactions
+    if len(training_features) >= 10:
+        X = np.array(training_features)
+        fraud_model.fit(X)
+        logger.info(f"Fraud model updated with {len(training_features)} new transactions")
 
     return {"message": f"Successfully seeded {len(transactions)} realistic transactions"}
+
+
+# Add a route to retrain the model on demand
+@app.post("/api/model/retrain")
+async def retrain_model(current_user: User = Depends(get_current_user)):
+    """Retrain the fraud detection model with all available transaction data"""
+    user_id = current_user.id
+
+    # Get all user transactions
+    transactions = list(db.transactions.find({"user_id": user_id}))
+
+    if len(transactions) < 10:
+        return {"message": "Not enough transaction data to train the model", "status": "error"}
+
+    # Extract features for training
+    features = []
+    for t in transactions:
+        # Extract basic features
+        features.append([
+            t['amount'],
+            t['timestamp'].hour,
+            1 if t.get('location_change', False) else 0,
+            t['risk_score'] / 100,  # Normalize risk score
+            1 if t['is_fraudulent'] else 0  # Target variable
+        ])
+
+    # Convert to numpy array
+    X = np.array(features)
+
+    # Train the model
+    success = fraud_model.fit(X)
+
+    if success:
+        return {"message": f"Model successfully retrained with {len(transactions)} transactions", "status": "success"}
+    else:
+        return {"message": "Error retraining model", "status": "error"}
+
+
+# Add a health check endpoint
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint to verify the API is running"""
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow(),
+        "model_trained": fraud_model.is_trained,
+        "version": "1.0.0"
+    }
+
+

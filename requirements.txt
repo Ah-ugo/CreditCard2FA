@@ -56,3 +56,4 @@ scikit-learn
 numpy
 joblib
 pillow
+pandas
